@@ -918,14 +918,57 @@ fn digest_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn linux_file_birth_time(path: &Path) -> Option<(i64, u32)> {
+    use std::ffi::CString;
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: `path` is NUL-terminated and `stat` points to writable storage for
+    // one `libc::statx` value. The value is only read after a successful call.
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            libc::AT_STATX_SYNC_AS_STAT,
+            libc::STATX_BTIME,
+            stat.as_mut_ptr(),
+        )
+    };
+    if result != 0 {
+        return None;
+    }
+
+    // SAFETY: statx returned success and initialized the output structure.
+    let stat = unsafe { stat.assume_init() };
+    (stat.stx_mask & libc::STATX_BTIME != 0)
+        .then_some((stat.stx_btime.tv_sec, stat.stx_btime.tv_nsec))
+}
+
 fn source_file_incarnation(path: &Path) -> Result<String, AppError> {
     let metadata = fs::metadata(path)
         .map_err(|error| AppError::Database(format!("读取 Hermes SQLite 元数据失败: {error}")))?;
     let identity = {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(all(target_os = "linux", target_env = "gnu"))))]
         {
             use std::os::unix::fs::MetadataExt;
             format!("unix:{}:{}", metadata.dev(), metadata.ino())
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            if let Some((seconds, nanoseconds)) = linux_file_birth_time(path) {
+                format!(
+                    "unix:{}:{}:{seconds}:{nanoseconds}",
+                    metadata.dev(),
+                    metadata.ino()
+                )
+            } else {
+                format!("unix:{}:{}", metadata.dev(), metadata.ino())
+            }
         }
         #[cfg(windows)]
         {
