@@ -3989,4 +3989,68 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn migrates_upstream_v18_byte_cursor_database_to_hermes_schema() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE session_log_sync (
+                file_path TEXT PRIMARY KEY,
+                last_modified INTEGER NOT NULL,
+                last_line_offset INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER NOT NULL,
+                last_byte_offset INTEGER,
+                last_tail_fingerprint INTEGER
+             );
+             INSERT INTO session_log_sync VALUES ('/tmp/a.jsonl', 5, 3, 1, 42, 99);",
+        )?;
+        Database::set_user_version(&conn, 18)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        assert!(Database::table_exists(&conn, "hermes_usage_snapshots")?);
+        assert!(Database::table_exists(&conn, "hermes_usage_deltas")?);
+        let cursor: (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT last_byte_offset, last_tail_fingerprint
+             FROM session_log_sync WHERE file_path = '/tmp/a.jsonl'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(cursor, (Some(42), Some(99)));
+        Ok(())
+    }
+
+    #[test]
+    fn migrates_hermes_v18_database_to_byte_cursor_schema() -> Result<(), AppError> {
+        let conn = Connection::open_in_memory()?;
+        Database::create_hermes_usage_tables_on_conn(&conn)?;
+        conn.execute_batch(
+            "CREATE TABLE session_log_sync (
+                file_path TEXT PRIMARY KEY,
+                last_modified INTEGER NOT NULL,
+                last_line_offset INTEGER NOT NULL DEFAULT 0,
+                last_synced_at INTEGER NOT NULL
+             );
+             INSERT INTO session_log_sync VALUES ('/tmp/a.jsonl', 5, 3, 1);",
+        )?;
+        Database::set_user_version(&conn, 18)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "last_byte_offset"
+        )?);
+        assert!(Database::has_column(
+            &conn,
+            "session_log_sync",
+            "last_tail_fingerprint"
+        )?);
+        assert!(Database::table_exists(&conn, "hermes_usage_snapshots")?);
+        assert!(Database::table_exists(&conn, "hermes_usage_deltas")?);
+        Ok(())
+    }
 }
