@@ -22,6 +22,7 @@ use std::str::FromStr;
 pub(crate) const HERMES_APP_TYPE: &str = "hermes";
 pub(crate) const HERMES_DATA_SOURCE: &str = "hermes_session";
 pub(crate) const HERMES_PRECISION: &str = "aggregate_delta";
+const HERMES_UNATTRIBUTED_MAIN_TASK: &str = "unattributed_main";
 
 /// Filters used by dashboard aggregate queries. A filter is applied only to
 /// Hermes delta rows; non-Hermes queries keep their existing semantics.
@@ -336,7 +337,10 @@ fn open_hermes_database(path: &Path) -> Result<Connection, AppError> {
 
 fn read_hermes_database(path: &Path) -> Result<Vec<HermesSourceRow>, AppError> {
     let conn = open_hermes_database(path)?;
-    let table_exists: bool = conn
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| AppError::Database(format!("启动 Hermes 读取事务失败: {error}")))?;
+    let table_exists: bool = tx
         .query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM sqlite_master
@@ -352,19 +356,92 @@ fn read_hermes_database(path: &Path) -> Result<Vec<HermesSourceRow>, AppError> {
         ));
     }
 
+    let mut result = {
+        let mut statement = tx.prepare(
+            "SELECT
+                session_id, model, billing_provider, billing_base_url, billing_mode, task,
+                api_call_count, input_tokens, output_tokens, cache_read_tokens,
+                cache_write_tokens, reasoning_tokens, estimated_cost_usd, actual_cost_usd,
+                cost_status, cost_source, first_seen, last_seen
+             FROM session_model_usage
+             ORDER BY session_id, model, billing_provider, billing_mode, task",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut detail_rows = Vec::new();
+        while let Some(row) = rows.next()? {
+            detail_rows.push(parse_hermes_source_row(row)?);
+        }
+        detail_rows
+    };
+    if has_session_call_count_contract(&tx)? {
+        result.extend(read_unattributed_main_rows(&tx)?);
+    }
+    tx.commit()
+        .map_err(|error| AppError::Database(format!("提交 Hermes 读取事务失败: {error}")))?;
+    Ok(result)
+}
+
+fn has_session_call_count_contract(conn: &Connection) -> Result<bool, AppError> {
+    let mut statement = conn.prepare("PRAGMA table_info(sessions)")?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut has_id = false;
+    let mut has_api_call_count = false;
+    for column in columns {
+        match column?.as_str() {
+            "id" => has_id = true,
+            "api_call_count" => has_api_call_count = true,
+            _ => {}
+        }
+    }
+    Ok(has_id && has_api_call_count)
+}
+
+fn read_unattributed_main_rows(conn: &Connection) -> Result<Vec<HermesSourceRow>, AppError> {
     let mut statement = conn.prepare(
-        "SELECT
-            session_id, model, billing_provider, billing_base_url, billing_mode, task,
-            api_call_count, input_tokens, output_tokens, cache_read_tokens,
-            cache_write_tokens, reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-            cost_status, cost_source, first_seen, last_seen
-         FROM session_model_usage
-         ORDER BY session_id, model, billing_provider, billing_mode, task",
+        "SELECT s.id, s.api_call_count,
+                COALESCE(SUM(CASE WHEN usage.task = '' THEN usage.api_call_count ELSE 0 END), 0)
+         FROM sessions s
+         LEFT JOIN session_model_usage usage ON usage.session_id = s.id
+         GROUP BY s.id, s.api_call_count
+         ORDER BY s.id",
     )?;
     let mut rows = statement.query([])?;
     let mut result = Vec::new();
     while let Some(row) = rows.next()? {
-        result.push(parse_hermes_source_row(row)?);
+        let session_id = read_required_text(row, 0, "sessions.id")?;
+        let session_total = read_counter(row, 1, "sessions.api_call_count")?;
+        let attributed_main = read_counter(row, 2, "main api_call_count")?;
+        let residual = session_total.saturating_sub(attributed_main);
+        if residual == 0 {
+            continue;
+        }
+        result.push(HermesSourceRow {
+            row_key: digest_parts(&[
+                "cc_switch_reconciliation",
+                &session_id,
+                HERMES_UNATTRIBUTED_MAIN_TASK,
+            ]),
+            session_id,
+            model: "unknown".to_string(),
+            billing_provider: String::new(),
+            billing_base_url_digest: digest_parts(&[""]),
+            billing_mode: String::new(),
+            task: HERMES_UNATTRIBUTED_MAIN_TASK.to_string(),
+            api_call_count: residual,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reasoning_tokens: 0,
+            estimated_cost_usd: None,
+            actual_cost_usd: None,
+            selected_cost_usd: Decimal::ZERO,
+            selected_cost_kind: "none".to_string(),
+            cost_status: None,
+            cost_source: None,
+            first_seen: None,
+            last_seen: None,
+        });
     }
     Ok(result)
 }
@@ -1141,6 +1218,21 @@ mod tests {
         .unwrap();
     }
 
+    fn add_session_call_total(conn: &Connection, session_id: &str, calls: i64) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                api_call_count INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (id, api_call_count) VALUES (?1, ?2)",
+            params![session_id, calls],
+        )
+        .unwrap();
+    }
+
     fn run_sync(db: &Database, root: &Path, at: i64) -> SessionSyncResult {
         sync_hermes_usage_at_root(db, root, at).unwrap()
     }
@@ -1210,6 +1302,168 @@ mod tests {
         assert_eq!(rows[0].api_call_count, 4);
         assert_eq!(rows[0].task, "wal-task");
         drop(writer);
+    }
+
+    #[test]
+    fn session_total_adds_only_unattributed_main_residual() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch(SOURCE_SCHEMA).unwrap();
+        insert_source_row(
+            &writer,
+            "",
+            6,
+            600,
+            60,
+            0,
+            0,
+            0,
+            "3.000000",
+            None,
+            "estimated",
+        );
+        insert_source_row(
+            &writer,
+            "compression",
+            3,
+            300,
+            30,
+            0,
+            0,
+            0,
+            "1.500000",
+            None,
+            "estimated",
+        );
+        add_session_call_total(&writer, "session-1", 10);
+
+        let rows = read_hermes_database(&path).unwrap();
+        assert_eq!(rows.len(), 3);
+        let residual = rows
+            .iter()
+            .find(|row| row.task == "unattributed_main")
+            .unwrap();
+        assert_eq!(residual.api_call_count, 4);
+        assert_eq!(residual.model, "unknown");
+        assert_eq!(residual.billing_provider, "");
+        assert_eq!(residual.billing_base_url_digest, digest_parts(&[""]));
+        assert_eq!(residual.billing_mode, "");
+        assert_eq!(residual.input_tokens, 0);
+        assert_eq!(residual.output_tokens, 0);
+        assert_eq!(residual.cache_read_tokens, 0);
+        assert_eq!(residual.cache_write_tokens, 0);
+        assert_eq!(residual.reasoning_tokens, 0);
+        assert_eq!(residual.selected_cost_usd, Decimal::ZERO);
+    }
+
+    #[test]
+    fn covered_total_or_missing_session_contract_adds_no_residual() {
+        let root = tempdir().unwrap();
+        let covered_path = root.path().join("covered.db");
+        let covered = source_db(&covered_path, "");
+        add_session_call_total(&covered, "session-1", 1);
+        let covered_rows = read_hermes_database(&covered_path).unwrap();
+        assert_eq!(covered_rows.len(), 1);
+        assert!(covered_rows
+            .iter()
+            .all(|row| row.task != "unattributed_main"));
+
+        let legacy_path = root.path().join("legacy.db");
+        let _legacy = source_db(&legacy_path, "");
+        let legacy_rows = read_hermes_database(&legacy_path).unwrap();
+        assert_eq!(legacy_rows.len(), 1);
+        assert!(legacy_rows
+            .iter()
+            .all(|row| row.task != "unattributed_main"));
+    }
+
+    #[test]
+    fn session_residual_increase_is_emitted_once() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch(SOURCE_SCHEMA).unwrap();
+        insert_source_row(
+            &writer,
+            "",
+            6,
+            600,
+            60,
+            0,
+            0,
+            0,
+            "3.000000",
+            None,
+            "estimated",
+        );
+        insert_source_row(
+            &writer,
+            "compression",
+            3,
+            300,
+            30,
+            0,
+            0,
+            0,
+            "1.500000",
+            None,
+            "estimated",
+        );
+        add_session_call_total(&writer, "session-1", 10);
+        let db = Database::memory().unwrap();
+
+        let first = run_sync(&db, root.path(), 100);
+        assert_eq!(first.imported, 0);
+        writer
+            .execute(
+                "UPDATE sessions SET api_call_count = 12 WHERE id = 'session-1'",
+                [],
+            )
+            .unwrap();
+
+        let second = run_sync(&db, root.path(), 200);
+        assert_eq!(second.imported, 1);
+        let conn = db.conn.lock().unwrap();
+        let delta: (String, String, String, i64, i64, String) = conn
+            .query_row(
+                "SELECT task, provider, model, api_call_count, input_tokens, cost_usd
+                 FROM hermes_usage_deltas",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            delta,
+            (
+                "unattributed_main".to_string(),
+                "".to_string(),
+                "unknown".to_string(),
+                2,
+                0,
+                "0.000000".to_string(),
+            )
+        );
+        drop(conn);
+
+        let third = run_sync(&db, root.path(), 300);
+        assert_eq!(third.imported, 0);
+        let conn = db.conn.lock().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM hermes_usage_deltas", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
