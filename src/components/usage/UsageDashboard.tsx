@@ -359,7 +359,17 @@ export function UsageDashboard({
   const isEmpty =
     appType !== "hermes" &&
     allTimeSummary != null &&
-    allTimeSummary.totalRequests === 0;
+    allTimeSummary.totalRequests === 0 &&
+    Number(allTimeSummary.totalCost ?? 0) === 0 &&
+    [
+      allTimeSummary.totalInputTokens,
+      allTimeSummary.totalOutputTokens,
+      allTimeSummary.totalCacheCreationTokens,
+      allTimeSummary.totalCacheReadTokens,
+      allTimeSummary.totalCacheWriteTokens,
+      allTimeSummary.totalReasoningTokens,
+      allTimeSummary.realTotalTokens,
+    ].every((count) => (count ?? 0) === 0);
   const { data: summaryByApp } = useUsageSummaryByApp(
     range,
     { providerName, model, profileName, task },

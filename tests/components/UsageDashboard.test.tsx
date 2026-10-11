@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ComponentProps } from "react";
+import type { UsageSummary } from "@/types/usage";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   UsageDashboard,
@@ -504,6 +505,56 @@ describe("UsageDashboard", () => {
     expect(await screen.findByText("usage.empty.title")).toBeInTheDocument();
     expect(screen.queryByTestId("usage-hero")).not.toBeInTheDocument();
   });
+
+  const zeroCallUsageCases: (readonly [string, Partial<UsageSummary>])[] = [
+    ["positive cost", { totalCost: "0.500000" }] as const,
+    ["negative cost correction", { totalCost: "-0.500000" }] as const,
+    ...[
+      "totalInputTokens",
+      "totalOutputTokens",
+      "totalCacheCreationTokens",
+      "totalCacheReadTokens",
+      "totalCacheWriteTokens",
+      "totalReasoningTokens",
+      "realTotalTokens",
+    ].map((field) => [field, { [field]: 1 }] as const),
+  ];
+  it.each(zeroCallUsageCases)(
+    "keeps All visible for zero-call %s usage",
+    async (_name, dimension) => {
+      usageApiMock.getUsageSummary.mockResolvedValue({
+        totalRequests: 0,
+        totalCost: "0",
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalCacheCreationTokens: 0,
+        totalCacheReadTokens: 0,
+        totalCacheWriteTokens: 0,
+        totalReasoningTokens: 0,
+        realTotalTokens: 0,
+        cacheHitRate: 0,
+        successRate: 0,
+        ...dimension,
+      });
+      useSummaryByAppMock.mockReturnValue({
+        data: [{ appType: "hermes", summary: {} }],
+      });
+      renderDashboard();
+      await waitFor(() =>
+        expect(usageApiMock.getUsageSummary).toHaveBeenCalled(),
+      );
+      // Wait for the summary's asynchronous query to settle before testing its branch.
+      await waitFor(() =>
+        expect(screen.queryByText("usage.empty.title")).not.toBeInTheDocument(),
+      );
+      expect(
+        await screen.findByTestId("hermes-precision-notice"),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("tab", { name: "usage.requestLogs" }),
+      ).toBeInTheDocument();
+    },
+  );
 
   it("still lets the pricing tab be opened from the empty state", async () => {
     usageApiMock.getUsageSummary.mockResolvedValue({ totalRequests: 0 });

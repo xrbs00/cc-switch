@@ -2092,6 +2092,7 @@
     },
     "hermes": {
       "mainTask": "Main task",
+      "reasoningTokens": "Reasoning tokens",
       "precisionNotice": "The count is a delta of Hermes's cumulative api_call_count; it is not an exact physical HTTP request, retry, or fallback count.",
       "syncWindowNotice": "Trend timestamps mark synchronization windows rather than exact request times.",
       "profile": "Profile",

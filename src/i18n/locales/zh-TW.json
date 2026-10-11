@@ -2092,6 +2092,7 @@
       "perActivity": "平均每次計數活動成本"
     },
     "hermes": {
+      "reasoningTokens": "推理 Token",
       "mainTask": "主工作",
       "precisionNotice": "計數是 Hermes 累積 api_call_count 的差值，不等同於精確的實體 HTTP 請求、重試或回退次數。",
       "syncWindowNotice": "趨勢時間點代表同步視窗，而非精確的請求時間。",

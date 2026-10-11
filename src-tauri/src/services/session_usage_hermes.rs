@@ -411,7 +411,7 @@ fn read_unattributed_main_rows(conn: &Connection) -> Result<Vec<HermesSourceRow>
         let session_id = read_required_text(row, 0, "sessions.id")?;
         let session_total = read_counter(row, 1, "sessions.api_call_count")?;
         let attributed_main = read_counter(row, 2, "main api_call_count")?;
-        let residual = session_total.saturating_sub(attributed_main);
+        let residual = session_total.saturating_sub(attributed_main).max(0);
         if residual == 0 {
             continue;
         }
@@ -1378,6 +1378,58 @@ mod tests {
         assert!(legacy_rows
             .iter()
             .all(|row| row.task != "unattributed_main"));
+    }
+
+    #[test]
+    fn session_residual_is_nonnegative_below_equal_and_above_main_calls() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let writer = source_db(&path, "");
+        writer
+            .execute("UPDATE session_model_usage SET api_call_count = 2", [])
+            .unwrap();
+        for total in [0, 1, 2, 3] {
+            add_session_call_total(&writer, "session-1", total);
+            let rows = read_hermes_database(&path).unwrap();
+            let residual = rows
+                .iter()
+                .find(|row| row.task == HERMES_UNATTRIBUTED_MAIN_TASK);
+            assert_eq!(
+                residual.map(|row| row.api_call_count),
+                if total > 2 { Some(1) } else { None },
+                "total={total}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_residual_catchup_does_not_emit_phantom_usage() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("state.db");
+        let writer = source_db(&path, "");
+        writer
+            .execute("UPDATE session_model_usage SET api_call_count = 2", [])
+            .unwrap();
+        add_session_call_total(&writer, "session-1", 0);
+        let db = Database::memory().unwrap();
+        assert_eq!(run_sync(&db, root.path(), 100).imported, 0);
+        add_session_call_total(&writer, "session-1", 1);
+        assert_eq!(run_sync(&db, root.path(), 200).imported, 0);
+        let conn = db.conn.lock().unwrap();
+        let negative_snapshots: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM hermes_usage_snapshots WHERE api_call_count < 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(negative_snapshots, 0);
+        let deltas: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hermes_usage_deltas", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(deltas, 0);
     }
 
     #[test]

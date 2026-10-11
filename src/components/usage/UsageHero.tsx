@@ -245,7 +245,12 @@ export function UsageHero({
                 : app.summary.totalCacheCreationTokens),
             0,
           );
-  const reasoning = summary?.totalReasoningTokens;
+  const reasoning = selectedApps.some(
+    (app) =>
+      app.appType === "hermes" && app.summary.totalReasoningTokens != null,
+  )
+    ? summary?.totalReasoningTokens
+    : undefined;
   const cacheRead = summary?.totalCacheReadTokens ?? 0;
   const realTotal = summary?.realTotalTokens ?? 0;
   const hitRate = summary?.cacheHitRate ?? 0;

@@ -2091,6 +2091,7 @@
       "perActivity": "集計アクティビティあたりの平均コスト"
     },
     "hermes": {
+      "reasoningTokens": "推論トークン",
       "mainTask": "メインタスク",
       "precisionNotice": "カウントは Hermes の累積 api_call_count の差分であり、物理 HTTP リクエスト、リトライ、フォールバックの正確な回数ではありません。",
       "syncWindowNotice": "トレンドの時刻は同期ウィンドウを示し、正確なリクエスト時刻ではありません。",
